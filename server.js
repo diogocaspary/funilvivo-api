@@ -1,6 +1,8 @@
 import express from "express";
 import cors from "cors";
 import nodemailer from "nodemailer";
+import { ImapFlow } from "imapflow";
+import { simpleParser } from "mailparser";
 import { createClient } from "@supabase/supabase-js";
 
 const {
@@ -157,6 +159,85 @@ app.post("/send/email", auth, async (req, res) => {
     await admin.from("atividades").insert({ tipo: "email_enviado", lead_id: lead.id, responsavel: "Closer", resumo: `E-mail enviado via ${canal.nome}` });
     res.json({ ok: true });
   } catch (e) { res.status(400).json({ error: String(e.message || e) }); }
+});
+
+// ---- leitura de e-mails (IMAP) ----
+async function imapConnect(canal) {
+  const client = new ImapFlow({
+    host: canal.imap_host,
+    port: canal.imap_port || 993,
+    secure: true,
+    auth: { user: canal.smtp_user, pass: canal.smtp_senha },
+    logger: false,
+  });
+  await client.connect();
+  return client;
+}
+
+// lista os últimos e-mails recebidos na caixa do canal
+app.get("/email/:id/inbox", auth, async (req, res) => {
+  let client;
+  try {
+    const { data: canal } = await admin.from("canais_email").select("*").eq("id", req.params.id).single();
+    if (!canal) return res.status(404).json({ error: "canal não encontrado" });
+    if (!canal.imap_host) return res.status(400).json({ error: "IMAP não configurado neste canal" });
+    client = await imapConnect(canal);
+    const lock = await client.getMailboxLock("INBOX");
+    const out = [];
+    try {
+      const status = await client.status("INBOX", { messages: true });
+      const total = status.messages || 0;
+      if (total > 0) {
+        const start = Math.max(1, total - 24);
+        for await (const m of client.fetch(`${start}:*`, { envelope: true, internalDate: true, flags: true })) {
+          const from = (m.envelope.from && m.envelope.from[0]) || {};
+          out.push({
+            seq: m.seq,
+            from: from.address || "",
+            fromName: from.name || "",
+            subject: m.envelope.subject || "(sem assunto)",
+            date: m.internalDate,
+            unseen: !(m.flags && m.flags.has && m.flags.has("\\Seen")),
+          });
+        }
+      }
+    } finally { lock.release(); }
+    await client.logout();
+    res.json({ ok: true, total: out.length, messages: out.reverse() });
+  } catch (e) {
+    try { if (client) await client.close(); } catch (_) {}
+    res.status(400).json({ error: String(e.message || e) });
+  }
+});
+
+// lê o conteúdo de um e-mail específico
+app.get("/email/:id/message", auth, async (req, res) => {
+  let client;
+  try {
+    const seq = parseInt(req.query.seq);
+    if (!seq) return res.status(400).json({ error: "parâmetro seq obrigatório" });
+    const { data: canal } = await admin.from("canais_email").select("*").eq("id", req.params.id).single();
+    if (!canal || !canal.imap_host) return res.status(400).json({ error: "canal/IMAP inválido" });
+    client = await imapConnect(canal);
+    const lock = await client.getMailboxLock("INBOX");
+    let message = {};
+    try {
+      const msg = await client.fetchOne(String(seq), { source: true });
+      const parsed = await simpleParser(msg.source);
+      message = {
+        from: (parsed.from && parsed.from.text) || "",
+        to: (parsed.to && parsed.to.text) || "",
+        subject: parsed.subject || "",
+        date: parsed.date,
+        text: parsed.text || "",
+      };
+    } finally { lock.release(); }
+    await client.logout();
+    res.json({ ok: true, message });
+  } catch (e) {
+    try { if (client) await client.close(); } catch (_) {}
+    res.status(400).json({ error: String(e.message || e) });
+  }
 });
 
 app.listen(PORT, () => console.log(`funilvivo-api on :${PORT}`));
