@@ -363,18 +363,93 @@ async function runMonitor() {
   } finally { monitorRunning = false; }
 }
 
-// dispara o monitor automaticamente
-const MONITOR_MIN = Math.max(1, parseInt(process.env.MONITOR_INTERVAL_MIN || "3"));
+// ============================================================
+// FILA DE AGENTE — produtor (lê e-mails -> enfileira) e
+// consumidor (resultados prontos do Claude -> envia). Sem IA aqui:
+// quem escreve a resposta é o worker (tarefa do Claude no Cowork).
+// ============================================================
+let queueRunning = false;
+async function runQueue() {
+  if (queueRunning) return;
+  queueRunning = true;
+  try {
+    // ---- PRODUTOR: lê e-mails novos e cria tarefas 'responder_email' ----
+    const { data: canais } = await admin.from("canais_email").select("*").eq("ativo", true).not("imap_host", "is", null);
+    for (const canal of (canais || [])) {
+      let client;
+      try {
+        client = await imapConnect(canal);
+        const lock = await client.getMailboxLock("INBOX");
+        try {
+          const uids = await client.search({ seen: false }, { uid: true });
+          for (const uid of (uids || []).slice(-20)) {
+            try {
+              const msg = await client.fetchOne(uid, { source: true }, { uid: true });
+              const parsed = await simpleParser(msg.source);
+              const from = ((parsed.from && parsed.from.value && parsed.from.value[0] && parsed.from.value[0].address) || "").toLowerCase();
+              await client.messageFlagsAdd(uid, ["\\Seen"], { uid: true });
+              if (!from || from === String(canal.from_email).toLowerCase()) continue;
+              const { data: leads } = await admin.from("leads").select("id,nome").eq("contato->>email", from).limit(1);
+              const lead = leads && leads[0];
+              if (!lead) { await admin.from("agent_logs").insert({ agente: "Fila", acao: "ignorado", resultado: "não é lead: " + from }); continue; }
+              const body = (parsed.text || "").toLowerCase();
+              if (SENSIVEIS.some((k) => body.includes(k))) {
+                await admin.from("aprovacoes").insert({ tipo: "envio_externo", titulo: "Resposta sensível de " + (lead.nome || from), solicitante: "Fila", detalhe: { lead_id: lead.id, assunto: parsed.subject, trecho: (parsed.text || "").slice(0, 400) } });
+                await admin.from("atividades").insert({ tipo: "resposta_sensivel", lead_id: lead.id, responsavel: "Fila", resumo: "Marcada para revisão humana" });
+                continue;
+              }
+              await admin.from("fila_agente").insert({
+                tipo: "responder_email", titulo: "Responder " + (lead.nome || from),
+                lead_id: lead.id, canal_id: canal.id, ref_uid: String(uid), status: "novo",
+                payload: { from, subject: parsed.subject || "", text: (parsed.text || "").slice(0, 4000), lead_nome: lead.nome || "" },
+              });
+              await admin.from("agent_logs").insert({ agente: "Fila", acao: "enfileirado", resultado: "responder_email p/ " + (lead.nome || from) });
+            } catch (inner) {
+              await admin.from("agent_logs").insert({ agente: "Fila", acao: "erro_msg", resultado: String(inner.message || inner) });
+            }
+          }
+        } finally { lock.release(); }
+        await client.logout();
+      } catch (e) {
+        try { if (client) await client.close(); } catch (_) {}
+        await admin.from("agent_logs").insert({ agente: "Fila", acao: "erro_imap", resultado: String(e.message || e) });
+      }
+    }
+
+    // ---- CONSUMIDOR: tarefas de e-mail concluídas pelo Claude -> envia ----
+    const { data: prontos } = await admin.from("fila_agente").select("*").eq("tipo", "responder_email").eq("status", "concluido").limit(10);
+    for (const t of (prontos || [])) {
+      const texto = t.resultado && t.resultado.texto;
+      if (!texto) { await admin.from("fila_agente").update({ status: "erro", erro: "sem texto no resultado", atualizado_em: new Date().toISOString() }).eq("id", t.id); continue; }
+      try {
+        const { data: canal } = await admin.from("canais_email").select("*").eq("id", t.canal_id).single();
+        if (!canal) throw new Error("canal não encontrado");
+        const to = t.payload.from;
+        const subj = (t.payload.subject || "").toLowerCase().startsWith("re:") ? t.payload.subject : ("Re: " + (t.payload.subject || "Contato"));
+        await sendViaCanal(canal, to, subj, texto);
+        await admin.from("outreach").insert({ lead_id: t.lead_id, canal: "email", etapa: "resposta_auto", assunto: subj, corpo: texto, status: "enviado", enviado_em: new Date().toISOString() });
+        await admin.from("atividades").insert({ tipo: "resposta_enviada", lead_id: t.lead_id, responsavel: "Closer (Claude)", resumo: "Resposta enviada via fila" });
+        if (t.lead_id) await admin.from("leads").update({ canal_email_id: t.canal_id }).eq("id", t.lead_id).is("canal_email_id", null);
+        await admin.from("fila_agente").update({ status: "enviado", atualizado_em: new Date().toISOString() }).eq("id", t.id);
+        await admin.from("agent_logs").insert({ agente: "Fila", acao: "enviado", resultado: "para " + to });
+      } catch (e) {
+        await admin.from("fila_agente").update({ status: "erro", erro: String(e.message || e), atualizado_em: new Date().toISOString() }).eq("id", t.id);
+      }
+    }
+  } finally { queueRunning = false; }
+}
+
+const QUEUE_MIN = Math.max(1, parseInt(process.env.MONITOR_INTERVAL_MIN || "1"));
 if ((process.env.MONITOR_ENABLED || "true") !== "false") {
-  setInterval(() => { runMonitor().catch(() => {}); }, MONITOR_MIN * 60 * 1000);
-  setTimeout(() => { runMonitor().catch(() => {}); }, 15000);
-  console.log(`monitor de respostas ativo (a cada ${MONITOR_MIN} min)`);
+  setInterval(() => { runQueue().catch(() => {}); }, QUEUE_MIN * 60 * 1000);
+  setTimeout(() => { runQueue().catch(() => {}); }, 15000);
+  console.log(`fila de agente ativa (a cada ${QUEUE_MIN} min)`);
 }
 
 // disparo manual do monitor (para testar)
 app.post("/monitor/run", auth, async (_req, res) => {
-  runMonitor().catch(() => {});
-  res.json({ ok: true, msg: "monitor disparado" });
+  runQueue().catch(() => {});
+  res.json({ ok: true, msg: "fila disparada" });
 });
 
 // ---- endpoints para a tarefa do Claude (Cowork) ----
