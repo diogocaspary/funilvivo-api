@@ -51,9 +51,20 @@ async function setWaStatus(id, status) {
   await admin.from("canais_whatsapp").update({ status }).eq("id", id);
 }
 
-// ---- auth middleware (verifica JWT do Supabase + papel) ----
+async function getMonitorKey() {
+  const { data } = await admin.from("agent_config").select("valor").eq("chave", "monitor_key").single();
+  return data && data.valor;
+}
+
+// ---- auth middleware: aceita JWT (admin/equipe) OU x-agent-key ----
 async function auth(req, res, next) {
   try {
+    const ak = req.headers["x-agent-key"];
+    if (ak) {
+      const mk = await getMonitorKey();
+      if (mk && ak === mk) { req.agent = true; return next(); }
+      return res.status(401).json({ error: "agent key inválida" });
+    }
     const h = req.headers.authorization || "";
     const token = h.startsWith("Bearer ") ? h.slice(7) : null;
     if (!token) return res.status(401).json({ error: "sem token" });
@@ -193,6 +204,7 @@ app.get("/email/:id/inbox", auth, async (req, res) => {
           const from = (m.envelope.from && m.envelope.from[0]) || {};
           out.push({
             seq: m.seq,
+            uid: m.uid,
             from: from.address || "",
             fromName: from.name || "",
             subject: m.envelope.subject || "(sem assunto)",
@@ -363,6 +375,44 @@ if ((process.env.MONITOR_ENABLED || "true") !== "false") {
 app.post("/monitor/run", auth, async (_req, res) => {
   runMonitor().catch(() => {});
   res.json({ ok: true, msg: "monitor disparado" });
+});
+
+// ---- endpoints para a tarefa do Claude (Cowork) ----
+// envia uma resposta e (opcional) marca o e-mail original como lido
+app.post("/send-raw", auth, async (req, res) => {
+  let c;
+  try {
+    const { canal_id, to, subject, text, uid, lead_id } = req.body || {};
+    if (!canal_id || !to || !text) return res.status(400).json({ error: "canal_id, to e text são obrigatórios" });
+    const { data: canal } = await admin.from("canais_email").select("*").eq("id", canal_id).single();
+    if (!canal) return res.status(404).json({ error: "canal não encontrado" });
+    await sendViaCanal(canal, to, subject || "Re: contato", text);
+    if (uid) {
+      try { c = await imapConnect(canal); const lock = await c.getMailboxLock("INBOX"); try { await c.messageFlagsAdd(uid, ["\\Seen"], { uid: true }); } finally { lock.release(); } await c.logout(); }
+      catch (_) { try { if (c) await c.close(); } catch (__) {} }
+    }
+    if (lead_id) {
+      await admin.from("outreach").insert({ lead_id, canal: "email", etapa: "resposta_auto", assunto: subject, corpo: text, status: "enviado", enviado_em: new Date().toISOString() });
+      await admin.from("atividades").insert({ tipo: "resposta_enviada", lead_id, responsavel: "Monitor (Claude)", resumo: "Resposta automática enviada" });
+      await admin.from("leads").update({ canal_email_id: canal.id }).eq("id", lead_id).is("canal_email_id", null);
+    }
+    await admin.from("agent_logs").insert({ agente: "Monitor (Claude)", acao: "respondido", resultado: "para " + to });
+    res.json({ ok: true });
+  } catch (e) { res.status(400).json({ error: String(e.message || e) }); }
+});
+
+// marca um e-mail como lido (para mensagens que a tarefa decidiu ignorar)
+app.post("/email/:id/seen", auth, async (req, res) => {
+  let c;
+  try {
+    const { uid } = req.body || {};
+    if (!uid) return res.status(400).json({ error: "uid obrigatório" });
+    const { data: canal } = await admin.from("canais_email").select("*").eq("id", req.params.id).single();
+    if (!canal) return res.status(404).json({ error: "canal não encontrado" });
+    c = await imapConnect(canal); const lock = await c.getMailboxLock("INBOX");
+    try { await c.messageFlagsAdd(uid, ["\\Seen"], { uid: true }); } finally { lock.release(); }
+    await c.logout(); res.json({ ok: true });
+  } catch (e) { try { if (c) await c.close(); } catch (_) {} res.status(400).json({ error: String(e.message || e) }); }
 });
 
 app.listen(PORT, () => console.log(`funilvivo-api on :${PORT}`));
