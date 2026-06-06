@@ -256,10 +256,21 @@ async function sendViaCanal(canal, to, subject, text) {
 }
 
 async function gerarResposta(lead, msgText) {
+  const ds = process.env.DEEPSEEK_API_KEY;
   const anth = process.env.ANTHROPIC_API_KEY;
   const oai = process.env.OPENAI_API_KEY;
   const sys = "Você é um SDR da Funil Vivo, agência de marketing (tráfego pago, social media e chatbots) focada em clínicas de saúde e estética. Responda ao e-mail do lead em português, de forma cordial, curta e consultiva. Objetivo: avançar para uma conversa ou reunião rápida. Não prometa resultados garantidos. Não invente preços; se perguntarem valor, diga que depende do escopo e proponha uma call de 15 min. Assine como 'Equipe Funil Vivo'. Escreva apenas o corpo do e-mail, sem assunto e sem placeholders.";
   const user = `Nome do lead: ${(lead && lead.nome) || "(desconhecido)"}\nMensagem recebida do lead:\n"""${(msgText || "").slice(0, 4000)}"""`;
+  if (ds) {
+    const r = await fetch("https://api.deepseek.com/chat/completions", {
+      method: "POST",
+      headers: { Authorization: "Bearer " + ds, "content-type": "application/json" },
+      body: JSON.stringify({ model: "deepseek-chat", max_tokens: 600, messages: [{ role: "system", content: sys }, { role: "user", content: user }] }),
+    });
+    const j = await r.json();
+    if (j.error) throw new Error("IA: " + JSON.stringify(j.error));
+    return (j.choices && j.choices[0] && j.choices[0].message.content || "").trim();
+  }
   if (anth) {
     const r = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -280,7 +291,7 @@ async function gerarResposta(lead, msgText) {
     if (j.error) throw new Error("IA: " + JSON.stringify(j.error));
     return (j.choices && j.choices[0] && j.choices[0].message.content || "").trim();
   }
-  throw new Error("sem chave de IA configurada (ANTHROPIC_API_KEY ou OPENAI_API_KEY)");
+  throw new Error("sem chave de IA configurada (DEEPSEEK_API_KEY, ANTHROPIC_API_KEY ou OPENAI_API_KEY)");
 }
 
 const SENSIVEIS = ["cancel", "reclama", "process", "advogad", "reembols", "descadastr", "remover", "juridic", "denunc"];
