@@ -240,4 +240,118 @@ app.get("/email/:id/message", auth, async (req, res) => {
   }
 });
 
+// ============================================================
+// MONITOR DE RESPOSTAS (24/7) — lê a caixa, identifica o lead,
+// gera resposta com IA e envia. Travas: só responde leads
+// conhecidos; assuntos sensíveis vão para aprovação humana.
+// ============================================================
+
+async function sendViaCanal(canal, to, subject, text) {
+  const transporter = nodemailer.createTransport({
+    host: canal.smtp_host, port: canal.smtp_port || 587,
+    secure: (canal.smtp_port || 587) === 465,
+    auth: { user: canal.smtp_user, pass: canal.smtp_senha },
+  });
+  await transporter.sendMail({ from: `"${canal.from_nome || "Funil Vivo"}" <${canal.from_email}>`, to, subject, text });
+}
+
+async function gerarResposta(lead, msgText) {
+  const anth = process.env.ANTHROPIC_API_KEY;
+  const oai = process.env.OPENAI_API_KEY;
+  const sys = "Você é um SDR da Funil Vivo, agência de marketing (tráfego pago, social media e chatbots) focada em clínicas de saúde e estética. Responda ao e-mail do lead em português, de forma cordial, curta e consultiva. Objetivo: avançar para uma conversa ou reunião rápida. Não prometa resultados garantidos. Não invente preços; se perguntarem valor, diga que depende do escopo e proponha uma call de 15 min. Assine como 'Equipe Funil Vivo'. Escreva apenas o corpo do e-mail, sem assunto e sem placeholders.";
+  const user = `Nome do lead: ${(lead && lead.nome) || "(desconhecido)"}\nMensagem recebida do lead:\n"""${(msgText || "").slice(0, 4000)}"""`;
+  if (anth) {
+    const r = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "x-api-key": anth, "anthropic-version": "2023-06-01", "content-type": "application/json" },
+      body: JSON.stringify({ model: "claude-3-5-haiku-latest", max_tokens: 600, system: sys, messages: [{ role: "user", content: user }] }),
+    });
+    const j = await r.json();
+    if (j.error) throw new Error("IA: " + JSON.stringify(j.error));
+    return (j.content && j.content[0] && j.content[0].text || "").trim();
+  }
+  if (oai) {
+    const r = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: { Authorization: "Bearer " + oai, "content-type": "application/json" },
+      body: JSON.stringify({ model: "gpt-4o-mini", max_tokens: 600, messages: [{ role: "system", content: sys }, { role: "user", content: user }] }),
+    });
+    const j = await r.json();
+    if (j.error) throw new Error("IA: " + JSON.stringify(j.error));
+    return (j.choices && j.choices[0] && j.choices[0].message.content || "").trim();
+  }
+  throw new Error("sem chave de IA configurada (ANTHROPIC_API_KEY ou OPENAI_API_KEY)");
+}
+
+const SENSIVEIS = ["cancel", "reclama", "process", "advogad", "reembols", "descadastr", "remover", "juridic", "denunc"];
+let monitorRunning = false;
+
+async function runMonitor() {
+  if (monitorRunning) return;
+  monitorRunning = true;
+  try {
+    const { data: canais } = await admin.from("canais_email").select("*").eq("ativo", true).not("imap_host", "is", null);
+    for (const canal of (canais || [])) {
+      let client;
+      try {
+        client = await imapConnect(canal);
+        const lock = await client.getMailboxLock("INBOX");
+        try {
+          const uids = await client.search({ seen: false }, { uid: true });
+          for (const uid of (uids || []).slice(-20)) {
+            try {
+              const msg = await client.fetchOne(uid, { source: true }, { uid: true });
+              const parsed = await simpleParser(msg.source);
+              const from = ((parsed.from && parsed.from.value && parsed.from.value[0] && parsed.from.value[0].address) || "").toLowerCase();
+              await client.messageFlagsAdd(uid, ["\\Seen"], { uid: true }); // marca lido (evita reprocessar)
+              if (!from || from === String(canal.from_email).toLowerCase()) continue;
+
+              const { data: leads } = await admin.from("leads").select("*").eq("contato->>email", from).limit(1);
+              const lead = leads && leads[0];
+              if (!lead) {
+                await admin.from("agent_logs").insert({ agente: "Monitor de Respostas", acao: "ignorado", resultado: "remetente não é lead: " + from });
+                continue;
+              }
+              const body = (parsed.text || "").toLowerCase();
+              if (SENSIVEIS.some((k) => body.includes(k))) {
+                await admin.from("aprovacoes").insert({ tipo: "envio_externo", titulo: "Resposta sensível de " + (lead.nome || from), solicitante: "Monitor de Respostas", cliente_id: null, detalhe: { lead_id: lead.id, assunto: parsed.subject, trecho: (parsed.text || "").slice(0, 400) } });
+                await admin.from("atividades").insert({ tipo: "resposta_sensivel", lead_id: lead.id, responsavel: "Monitor de Respostas", resumo: "Resposta marcada para revisão humana" });
+                continue;
+              }
+              const reply = await gerarResposta(lead, parsed.text || "");
+              if (!reply) continue;
+              const subj = (parsed.subject || "").toLowerCase().startsWith("re:") ? parsed.subject : ("Re: " + (parsed.subject || "Contato"));
+              await sendViaCanal(canal, from, subj, reply);
+              await admin.from("outreach").insert({ lead_id: lead.id, canal: "email", etapa: "resposta_auto", assunto: subj, corpo: reply, status: "enviado", enviado_em: new Date().toISOString() });
+              await admin.from("atividades").insert({ tipo: "resposta_enviada", lead_id: lead.id, responsavel: "Monitor de Respostas", resumo: "Resposta automática enviada" });
+              await admin.from("agent_logs").insert({ agente: "Monitor de Respostas", acao: "respondido", resultado: "lead " + (lead.nome || from) });
+              if (!lead.canal_email_id) await admin.from("leads").update({ canal_email_id: canal.id }).eq("id", lead.id);
+            } catch (inner) {
+              await admin.from("agent_logs").insert({ agente: "Monitor de Respostas", acao: "erro_msg", resultado: String(inner.message || inner) });
+            }
+          }
+        } finally { lock.release(); }
+        await client.logout();
+      } catch (e) {
+        try { if (client) await client.close(); } catch (_) {}
+        await admin.from("agent_logs").insert({ agente: "Monitor de Respostas", acao: "erro", resultado: String(e.message || e) });
+      }
+    }
+  } finally { monitorRunning = false; }
+}
+
+// dispara o monitor automaticamente
+const MONITOR_MIN = Math.max(1, parseInt(process.env.MONITOR_INTERVAL_MIN || "3"));
+if ((process.env.MONITOR_ENABLED || "true") !== "false") {
+  setInterval(() => { runMonitor().catch(() => {}); }, MONITOR_MIN * 60 * 1000);
+  setTimeout(() => { runMonitor().catch(() => {}); }, 15000);
+  console.log(`monitor de respostas ativo (a cada ${MONITOR_MIN} min)`);
+}
+
+// disparo manual do monitor (para testar)
+app.post("/monitor/run", auth, async (_req, res) => {
+  runMonitor().catch(() => {});
+  res.json({ ok: true, msg: "monitor disparado" });
+});
+
 app.listen(PORT, () => console.log(`funilvivo-api on :${PORT}`));
