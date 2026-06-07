@@ -574,7 +574,8 @@ app.post("/webhook/evolution/:token", async (req, res) => {
     if (!text || !phone) return res.json({ ok: true, notext: true });
     const { data: canal } = await admin.from("canais_whatsapp").select("*").eq("instancia", body.instance || "").maybeSingle();
     const canalId = canal ? canal.id : null;
-    let { data: leads } = await admin.from("leads").select("*").or(`contato->>telefone.eq.${phone},contato->>whatsapp.eq.${phone}`).limit(1);
+    try { await admin.from("agent_logs").insert({ agente: "Webhook", acao: "parse", resultado: `phone=${phone} textlen=${(text || "").length} inst=${body.instance || ""}` }); } catch (_) {}
+    let { data: leads } = await admin.from("leads").select("*").eq("contato->>telefone", phone).limit(1);
     let lead = leads && leads[0];
     if (!lead) {
       const { data: nl } = await admin.from("leads").insert({ nome: data.pushName || phone, canal_origem: "whatsapp", contato: { telefone: phone }, status: "novo", responsavel: "SDR" }).select().single();
@@ -590,7 +591,10 @@ app.post("/webhook/evolution/:token", async (req, res) => {
       }
     }
     res.json({ ok: true });
-  } catch (e) { res.status(200).json({ ok: false, error: String(e.message || e) }); }
+  } catch (e) {
+    try { await admin.from("agent_logs").insert({ agente: "Webhook", acao: "erro", resultado: String(e.message || e) }); } catch (_) {}
+    res.status(200).json({ ok: false, error: String(e.message || e) });
+  }
 });
 
 app.listen(PORT, () => console.log(`funilvivo-api on :${PORT}`));
