@@ -307,6 +307,12 @@ async function gerarResposta(lead, msgText) {
 }
 
 const SENSIVEIS = ["cancel", "reclama", "process", "advogad", "reembols", "descadastr", "remover", "juridic", "denunc"];
+const OPTOUT = ["sair", "descadastr", "parar", "remover", "não quero", "nao quero", "para de", "pare de", "me tira", "remova", "stop"];
+const FOLLOWUP_DIAS = Math.max(1, parseInt(process.env.FOLLOWUP_DIAS || "3"));
+const FOLLOWUP_MAX = Math.max(0, parseInt(process.env.FOLLOWUP_MAX || "2"));
+const followupDate = () => new Date(Date.now() + FOLLOWUP_DIAS * 86400000).toISOString();
+async function marcarInbound(leadId) { try { await admin.from("leads").update({ ultimo_contato: new Date().toISOString(), followups_enviados: 0, proximo_followup: null }).eq("id", leadId); } catch (_) {} }
+async function marcarOutbound(leadId) { try { await admin.from("leads").update({ ultimo_contato: new Date().toISOString(), proximo_followup: followupDate() }).eq("id", leadId); } catch (_) {} }
 let monitorRunning = false;
 
 async function runMonitor() {
@@ -392,7 +398,14 @@ async function runQueue() {
               const { data: leads } = await admin.from("leads").select("id,nome").eq("contato->>email", from).limit(1);
               const lead = leads && leads[0];
               if (!lead) { await admin.from("agent_logs").insert({ agente: "Fila", acao: "ignorado", resultado: "não é lead: " + from }); continue; }
+              await admin.from("mensagens").insert({ lead_id: lead.id, direcao: "entrada", canal: "email", de: from, para: canal.from_email, assunto: parsed.subject || "", corpo: (parsed.text || "").slice(0, 8000), status: "nao_lida" });
+              await marcarInbound(lead.id);
               const body = (parsed.text || "").toLowerCase();
+              if (OPTOUT.some((k) => body.includes(k))) {
+                await admin.from("leads").update({ nao_perturbe: true, status: "descartado" }).eq("id", lead.id);
+                await admin.from("agent_logs").insert({ agente: "Fila", acao: "opt_out", resultado: "lead pediu para parar: " + from });
+                continue;
+              }
               if (SENSIVEIS.some((k) => body.includes(k))) {
                 await admin.from("aprovacoes").insert({ tipo: "envio_externo", titulo: "Resposta sensível de " + (lead.nome || from), solicitante: "Fila", detalhe: { lead_id: lead.id, assunto: parsed.subject, trecho: (parsed.text || "").slice(0, 400) } });
                 await admin.from("atividades").insert({ tipo: "resposta_sensivel", lead_id: lead.id, responsavel: "Fila", resumo: "Marcada para revisão humana" });
@@ -404,7 +417,6 @@ async function runQueue() {
                 payload: { from, subject: parsed.subject || "", text: (parsed.text || "").slice(0, 4000), lead_nome: lead.nome || "" },
               });
               await admin.from("agent_logs").insert({ agente: "Fila", acao: "enfileirado", resultado: "responder_email p/ " + (lead.nome || from) });
-              await admin.from("mensagens").insert({ lead_id: lead.id, direcao: "entrada", canal: "email", de: from, para: canal.from_email, assunto: parsed.subject || "", corpo: (parsed.text || "").slice(0, 8000), status: "nao_lida" });
             } catch (inner) {
               await admin.from("agent_logs").insert({ agente: "Fila", acao: "erro_msg", resultado: String(inner.message || inner) });
             }
@@ -414,6 +426,33 @@ async function runQueue() {
       } catch (e) {
         try { if (client) await client.close(); } catch (_) {}
         await admin.from("agent_logs").insert({ agente: "Fila", acao: "erro_imap", resultado: String(e.message || e) });
+      }
+    }
+
+    // ---- PRODUTOR FOLLOW-UP: re-engaja leads em silêncio, com cadência saudável ----
+    if (FOLLOWUP_MAX > 0) {
+      const { data: pend } = await admin.from("leads")
+        .select("id,nome,contato,canal_email_id,segmento,followups_enviados")
+        .in("status", ["contatado", "qualificado"])
+        .eq("nao_perturbe", false)
+        .lt("followups_enviados", FOLLOWUP_MAX)
+        .not("proximo_followup", "is", null)
+        .lte("proximo_followup", new Date().toISOString())
+        .limit(10);
+      for (const l of (pend || [])) {
+        try {
+          const { data: ult } = await admin.from("mensagens").select("direcao").eq("lead_id", l.id).order("criado_em", { ascending: false }).limit(1);
+          if (!ult || !ult[0] || ult[0].direcao !== "saida") { await admin.from("leads").update({ proximo_followup: null }).eq("id", l.id); continue; }
+          const phone = l.contato && (l.contato.telefone || l.contato.whatsapp);
+          const email = l.contato && l.contato.email;
+          let canalTipo, canalId, dest;
+          if (phone) { canalTipo = "whatsapp"; const { data: wc } = await admin.from("canais_whatsapp").select("id").eq("ativo", true).limit(1).maybeSingle(); canalId = wc && wc.id; dest = phone; }
+          else if (email) { canalTipo = "email"; canalId = l.canal_email_id; dest = email; }
+          else { await admin.from("leads").update({ proximo_followup: null }).eq("id", l.id); continue; }
+          await admin.from("fila_agente").insert({ tipo: "followup", titulo: "Follow-up " + (l.nome || dest), lead_id: l.id, canal_id: canalId, status: "novo", payload: { canal: canalTipo, dest, lead_nome: l.nome || "", tentativa: (l.followups_enviados || 0) + 1 } });
+          await admin.from("leads").update({ followups_enviados: (l.followups_enviados || 0) + 1, proximo_followup: followupDate() }).eq("id", l.id);
+          await admin.from("agent_logs").insert({ agente: "Fila", acao: "followup_enfileirado", resultado: `${canalTipo} p/ ${l.nome || dest} (tent ${(l.followups_enviados || 0) + 1})` });
+        } catch (e) { await admin.from("agent_logs").insert({ agente: "Fila", acao: "erro_followup", resultado: String(e.message || e) }); }
       }
     }
 
@@ -431,7 +470,7 @@ async function runQueue() {
         await admin.from("outreach").insert({ lead_id: t.lead_id, canal: "email", etapa: "resposta_auto", assunto: subj, corpo: texto, status: "enviado", enviado_em: new Date().toISOString() });
         await admin.from("atividades").insert({ tipo: "resposta_enviada", lead_id: t.lead_id, responsavel: "Closer (Claude)", resumo: "Resposta enviada via fila" });
         await admin.from("mensagens").insert({ lead_id: t.lead_id, direcao: "saida", canal: "email", de: canal.from_email, para: to, assunto: subj, corpo: texto, status: "lida" });
-        if (t.lead_id) await admin.from("leads").update({ canal_email_id: t.canal_id }).eq("id", t.lead_id).is("canal_email_id", null);
+        if (t.lead_id) { await admin.from("leads").update({ canal_email_id: t.canal_id }).eq("id", t.lead_id).is("canal_email_id", null); await marcarOutbound(t.lead_id); }
         await admin.from("fila_agente").update({ status: "enviado", atualizado_em: new Date().toISOString() }).eq("id", t.id);
         await admin.from("agent_logs").insert({ agente: "Fila", acao: "enviado", resultado: "para " + to });
       } catch (e) {
@@ -459,6 +498,7 @@ async function runQueue() {
         await admin.from("atividades").insert({ tipo: "outreach_enviado", lead_id: o.lead_id, responsavel: "Closer", resumo: "Primeiro contato enviado" });
         await admin.from("mensagens").insert({ lead_id: o.lead_id, direcao: "saida", canal: "email", de: canal.from_email, para: dest, assunto: o.assunto, corpo: o.corpo, status: "lida" });
         await admin.from("leads").update({ status: "contatado" }).eq("id", o.lead_id).eq("status", "novo");
+        await marcarOutbound(o.lead_id);
         await admin.from("agent_logs").insert({ agente: "Fila", acao: "outreach_enviado", resultado: "para " + dest });
       } catch (e) {
         await admin.from("agent_logs").insert({ agente: "Fila", acao: "erro_outreach", resultado: String(e.message || e) });
@@ -476,11 +516,35 @@ async function runQueue() {
         await sendWhatsapp(canal, t.payload.from, texto);
         await admin.from("mensagens").insert({ lead_id: t.lead_id, direcao: "saida", canal: "whatsapp", para: t.payload.from, corpo: texto, status: "lida" });
         await admin.from("atividades").insert({ tipo: "whatsapp_enviado", lead_id: t.lead_id, responsavel: "Atendente (Claude)", resumo: "Resposta WhatsApp enviada" });
+        if (t.lead_id) await marcarOutbound(t.lead_id);
         await admin.from("fila_agente").update({ status: "enviado", atualizado_em: new Date().toISOString() }).eq("id", t.id);
         await admin.from("agent_logs").insert({ agente: "Fila", acao: "wa_enviado", resultado: "para " + t.payload.from });
       } catch (e) {
         await admin.from("fila_agente").update({ status: "erro", erro: String(e.message || e), atualizado_em: new Date().toISOString() }).eq("id", t.id);
       }
+    }
+
+    // ---- CONSUMIDOR FOLLOW-UP: envia os follow-ups prontos (e-mail ou WhatsApp) ----
+    const { data: fProntos } = await admin.from("fila_agente").select("*").eq("tipo", "followup").eq("status", "concluido").limit(10);
+    for (const t of (fProntos || [])) {
+      const texto = t.resultado && t.resultado.texto;
+      if (!texto) { await admin.from("fila_agente").update({ status: "erro", erro: "sem texto", atualizado_em: new Date().toISOString() }).eq("id", t.id); continue; }
+      try {
+        const canalTipo = t.payload && t.payload.canal, dest = t.payload && t.payload.dest;
+        if (canalTipo === "whatsapp") {
+          const { data: canal } = await admin.from("canais_whatsapp").select("*").eq("id", t.canal_id).single();
+          await sendWhatsapp(canal, dest, texto);
+          await admin.from("mensagens").insert({ lead_id: t.lead_id, direcao: "saida", canal: "whatsapp", para: dest, corpo: texto, status: "lida" });
+        } else {
+          const { data: canal } = await admin.from("canais_email").select("*").eq("id", t.canal_id).single();
+          await sendViaCanal(canal, dest, "Funil Vivo", texto);
+          await admin.from("mensagens").insert({ lead_id: t.lead_id, direcao: "saida", canal: "email", para: dest, assunto: "Funil Vivo", corpo: texto, status: "lida" });
+        }
+        if (t.lead_id) await marcarOutbound(t.lead_id);
+        await admin.from("atividades").insert({ tipo: "followup_enviado", lead_id: t.lead_id, responsavel: "Bia", resumo: "Follow-up enviado" });
+        await admin.from("fila_agente").update({ status: "enviado", atualizado_em: new Date().toISOString() }).eq("id", t.id);
+        await admin.from("agent_logs").insert({ agente: "Fila", acao: "followup_enviado", resultado: "para " + dest });
+      } catch (e) { await admin.from("fila_agente").update({ status: "erro", erro: String(e.message || e), atualizado_em: new Date().toISOString() }).eq("id", t.id); }
     }
   } finally { queueRunning = false; }
 }
@@ -583,8 +647,12 @@ app.post("/webhook/evolution/:token", async (req, res) => {
     }
     if (lead) {
       await admin.from("mensagens").insert({ lead_id: lead.id, direcao: "entrada", canal: "whatsapp", de: phone, corpo: text, status: "nao_lida" });
+      await marcarInbound(lead.id);
       const low = text.toLowerCase();
-      if (SENSIVEIS.some((k) => low.includes(k))) {
+      if (OPTOUT.some((k) => low.includes(k))) {
+        await admin.from("leads").update({ nao_perturbe: true }).eq("id", lead.id);
+        await admin.from("agent_logs").insert({ agente: "Fila", acao: "opt_out", resultado: "lead pediu para parar (WhatsApp): " + phone });
+      } else if (SENSIVEIS.some((k) => low.includes(k))) {
         await admin.from("aprovacoes").insert({ tipo: "envio_externo", titulo: "WhatsApp sensível de " + (lead.nome || phone), solicitante: "Fila", detalhe: { lead_id: lead.id, trecho: text.slice(0, 400) } });
       } else {
         await admin.from("fila_agente").insert({ tipo: "responder_whatsapp", titulo: "Responder WhatsApp " + (lead.nome || phone), lead_id: lead.id, canal_id: canalId, payload: { from: phone, text, lead_nome: lead.nome || "", canal: "whatsapp" }, status: "novo" });
