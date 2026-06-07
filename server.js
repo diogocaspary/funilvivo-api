@@ -379,6 +379,7 @@ async function runQueue() {
   if (queueRunning) return;
   queueRunning = true;
   try {
+    try { await admin.rpc("dedup_leads"); } catch (_) {} // unifica duplicados a cada ciclo
     // ---- PRODUTOR: lê e-mails novos e cria tarefas 'responder_email' ----
     const { data: canais } = await admin.from("canais_email").select("*").eq("ativo", true).not("imap_host", "is", null);
     for (const canal of (canais || [])) {
