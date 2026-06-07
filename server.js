@@ -436,6 +436,31 @@ async function runQueue() {
         await admin.from("fila_agente").update({ status: "erro", erro: String(e.message || e), atualizado_em: new Date().toISOString() }).eq("id", t.id);
       }
     }
+
+    // ---- OUTBOUND: rascunhos de outreach aprovados -> enviar ----
+    const { data: aprovados } = await admin.from("outreach").select("*").eq("status", "aprovado").limit(10);
+    for (const o of (aprovados || [])) {
+      try {
+        const { data: lead } = await admin.from("leads").select("*").eq("id", o.lead_id).single();
+        const dest = lead && lead.contato && lead.contato.email;
+        if (!dest) { await admin.from("outreach").update({ status: "descartado" }).eq("id", o.id); continue; }
+        let canalId = lead.canal_email_id;
+        if (!canalId) {
+          const { data: at } = await admin.from("canais_email").select("id").eq("ativo", true).limit(1).single();
+          if (!at) continue; // sem canal ativo: tenta de novo no próximo ciclo
+          canalId = at.id;
+          await admin.from("leads").update({ canal_email_id: canalId }).eq("id", lead.id);
+        }
+        const { data: canal } = await admin.from("canais_email").select("*").eq("id", canalId).single();
+        await sendViaCanal(canal, dest, o.assunto || "Funil Vivo", o.corpo || "");
+        await admin.from("outreach").update({ status: "enviado", enviado_em: new Date().toISOString() }).eq("id", o.id);
+        await admin.from("atividades").insert({ tipo: "outreach_enviado", lead_id: o.lead_id, responsavel: "Closer", resumo: "Primeiro contato enviado" });
+        await admin.from("leads").update({ status: "contatado" }).eq("id", o.lead_id).eq("status", "novo");
+        await admin.from("agent_logs").insert({ agente: "Fila", acao: "outreach_enviado", resultado: "para " + dest });
+      } catch (e) {
+        await admin.from("agent_logs").insert({ agente: "Fila", acao: "erro_outreach", resultado: String(e.message || e) });
+      }
+    }
   } finally { queueRunning = false; }
 }
 
