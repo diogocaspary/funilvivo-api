@@ -561,6 +561,7 @@ app.post("/webhook/evolution/:token", async (req, res) => {
     const mk = await getMonitorKey();
     if (!mk || req.params.token !== mk) return res.status(401).json({ error: "token" });
     const body = req.body || {};
+    try { await admin.from("agent_logs").insert({ agente: "Webhook", acao: "recebido", resultado: String(body.event || "sem-event") + " fromMe=" + ((body.data && body.data.key && body.data.key.fromMe) ? "1" : "0") }); } catch (_) {}
     if (!/messages.upsert/i.test(body.event || "")) return res.json({ ok: true, ignored: body.event });
     const data = body.data || {};
     const key = data.key || {};
