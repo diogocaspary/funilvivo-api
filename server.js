@@ -404,6 +404,7 @@ async function runQueue() {
                 payload: { from, subject: parsed.subject || "", text: (parsed.text || "").slice(0, 4000), lead_nome: lead.nome || "" },
               });
               await admin.from("agent_logs").insert({ agente: "Fila", acao: "enfileirado", resultado: "responder_email p/ " + (lead.nome || from) });
+              await admin.from("mensagens").insert({ lead_id: lead.id, direcao: "entrada", canal: "email", de: from, para: canal.from_email, assunto: parsed.subject || "", corpo: (parsed.text || "").slice(0, 8000), status: "nao_lida" });
             } catch (inner) {
               await admin.from("agent_logs").insert({ agente: "Fila", acao: "erro_msg", resultado: String(inner.message || inner) });
             }
@@ -429,6 +430,7 @@ async function runQueue() {
         await sendViaCanal(canal, to, subj, texto);
         await admin.from("outreach").insert({ lead_id: t.lead_id, canal: "email", etapa: "resposta_auto", assunto: subj, corpo: texto, status: "enviado", enviado_em: new Date().toISOString() });
         await admin.from("atividades").insert({ tipo: "resposta_enviada", lead_id: t.lead_id, responsavel: "Closer (Claude)", resumo: "Resposta enviada via fila" });
+        await admin.from("mensagens").insert({ lead_id: t.lead_id, direcao: "saida", canal: "email", de: canal.from_email, para: to, assunto: subj, corpo: texto, status: "lida" });
         if (t.lead_id) await admin.from("leads").update({ canal_email_id: t.canal_id }).eq("id", t.lead_id).is("canal_email_id", null);
         await admin.from("fila_agente").update({ status: "enviado", atualizado_em: new Date().toISOString() }).eq("id", t.id);
         await admin.from("agent_logs").insert({ agente: "Fila", acao: "enviado", resultado: "para " + to });
@@ -455,6 +457,7 @@ async function runQueue() {
         await sendViaCanal(canal, dest, o.assunto || "Funil Vivo", o.corpo || "");
         await admin.from("outreach").update({ status: "enviado", enviado_em: new Date().toISOString() }).eq("id", o.id);
         await admin.from("atividades").insert({ tipo: "outreach_enviado", lead_id: o.lead_id, responsavel: "Closer", resumo: "Primeiro contato enviado" });
+        await admin.from("mensagens").insert({ lead_id: o.lead_id, direcao: "saida", canal: "email", de: canal.from_email, para: dest, assunto: o.assunto, corpo: o.corpo, status: "lida" });
         await admin.from("leads").update({ status: "contatado" }).eq("id", o.lead_id).eq("status", "novo");
         await admin.from("agent_logs").insert({ agente: "Fila", acao: "outreach_enviado", resultado: "para " + dest });
       } catch (e) {
