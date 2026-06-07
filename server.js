@@ -464,6 +464,24 @@ async function runQueue() {
         await admin.from("agent_logs").insert({ agente: "Fila", acao: "erro_outreach", resultado: String(e.message || e) });
       }
     }
+
+    // ---- CONSUMIDOR WhatsApp: respostas prontas -> enviar via Evolution ----
+    const { data: waProntos } = await admin.from("fila_agente").select("*").eq("tipo", "responder_whatsapp").eq("status", "concluido").limit(10);
+    for (const t of (waProntos || [])) {
+      const texto = t.resultado && t.resultado.texto;
+      if (!texto) { await admin.from("fila_agente").update({ status: "erro", erro: "sem texto", atualizado_em: new Date().toISOString() }).eq("id", t.id); continue; }
+      try {
+        const { data: canal } = await admin.from("canais_whatsapp").select("*").eq("id", t.canal_id).single();
+        if (!canal) throw new Error("canal whatsapp não encontrado");
+        await sendWhatsapp(canal, t.payload.from, texto);
+        await admin.from("mensagens").insert({ lead_id: t.lead_id, direcao: "saida", canal: "whatsapp", para: t.payload.from, corpo: texto, status: "lida" });
+        await admin.from("atividades").insert({ tipo: "whatsapp_enviado", lead_id: t.lead_id, responsavel: "Atendente (Claude)", resumo: "Resposta WhatsApp enviada" });
+        await admin.from("fila_agente").update({ status: "enviado", atualizado_em: new Date().toISOString() }).eq("id", t.id);
+        await admin.from("agent_logs").insert({ agente: "Fila", acao: "wa_enviado", resultado: "para " + t.payload.from });
+      } catch (e) {
+        await admin.from("fila_agente").update({ status: "erro", erro: String(e.message || e), atualizado_em: new Date().toISOString() }).eq("id", t.id);
+      }
+    }
   } finally { queueRunning = false; }
 }
 
@@ -516,6 +534,62 @@ app.post("/email/:id/seen", auth, async (req, res) => {
     try { await c.messageFlagsAdd(uid, ["\\Seen"], { uid: true }); } finally { lock.release(); }
     await c.logout(); res.json({ ok: true });
   } catch (e) { try { if (c) await c.close(); } catch (_) {} res.status(400).json({ error: String(e.message || e) }); }
+});
+
+// ---- WhatsApp: enviar e receber (Evolution) ----
+async function sendWhatsapp(canal, number, text) {
+  return evo(canal, `/message/sendText/${encodeURIComponent(canal.instancia)}`, "POST", { number, text });
+}
+
+// configura o webhook da instância para apontar pro nosso backend
+app.post("/wa/:id/webhook", auth, async (req, res) => {
+  try {
+    const { data: canal } = await admin.from("canais_whatsapp").select("*").eq("id", req.params.id).single();
+    if (!canal) return res.status(404).json({ error: "canal não encontrado" });
+    const mk = await getMonitorKey();
+    const url = `https://api.funilvivo.com.br/webhook/evolution/${mk}`;
+    const data = await evo(canal, `/webhook/set/${encodeURIComponent(canal.instancia)}`, "POST", {
+      webhook: { enabled: true, url, webhookByEvents: false, webhookBase64: false, events: ["MESSAGES_UPSERT"] },
+    });
+    res.json({ ok: true, data });
+  } catch (e) { res.status(400).json({ error: String(e.message || e) }); }
+});
+
+// recebe mensagens da Evolution
+app.post("/webhook/evolution/:token", async (req, res) => {
+  try {
+    const mk = await getMonitorKey();
+    if (!mk || req.params.token !== mk) return res.status(401).json({ error: "token" });
+    const body = req.body || {};
+    if (!/messages.upsert/i.test(body.event || "")) return res.json({ ok: true, ignored: body.event });
+    const data = body.data || {};
+    const key = data.key || {};
+    if (key.fromMe) return res.json({ ok: true, self: true });
+    const jid = key.remoteJid || "";
+    if (jid.endsWith("@g.us")) return res.json({ ok: true, group: true });
+    const phone = jid.split("@")[0];
+    const m = data.message || {};
+    const text = m.conversation || (m.extendedTextMessage && m.extendedTextMessage.text) || (m.imageMessage && m.imageMessage.caption) || "";
+    if (!text || !phone) return res.json({ ok: true, notext: true });
+    const { data: canal } = await admin.from("canais_whatsapp").select("*").eq("instancia", body.instance || "").maybeSingle();
+    const canalId = canal ? canal.id : null;
+    let { data: leads } = await admin.from("leads").select("*").or(`contato->>telefone.eq.${phone},contato->>whatsapp.eq.${phone}`).limit(1);
+    let lead = leads && leads[0];
+    if (!lead) {
+      const { data: nl } = await admin.from("leads").insert({ nome: data.pushName || phone, canal_origem: "whatsapp", contato: { telefone: phone }, status: "novo", responsavel: "SDR" }).select().single();
+      lead = nl;
+    }
+    if (lead) {
+      await admin.from("mensagens").insert({ lead_id: lead.id, direcao: "entrada", canal: "whatsapp", de: phone, corpo: text, status: "nao_lida" });
+      const low = text.toLowerCase();
+      if (SENSIVEIS.some((k) => low.includes(k))) {
+        await admin.from("aprovacoes").insert({ tipo: "envio_externo", titulo: "WhatsApp sensível de " + (lead.nome || phone), solicitante: "Fila", detalhe: { lead_id: lead.id, trecho: text.slice(0, 400) } });
+      } else {
+        await admin.from("fila_agente").insert({ tipo: "responder_whatsapp", titulo: "Responder WhatsApp " + (lead.nome || phone), lead_id: lead.id, canal_id: canalId, payload: { from: phone, text, lead_nome: lead.nome || "", canal: "whatsapp" }, status: "novo" });
+      }
+    }
+    res.json({ ok: true });
+  } catch (e) { res.status(200).json({ ok: false, error: String(e.message || e) }); }
 });
 
 app.listen(PORT, () => console.log(`funilvivo-api on :${PORT}`));
