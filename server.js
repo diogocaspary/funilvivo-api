@@ -144,6 +144,35 @@ app.get("/voices", auth, async (_req, res) => {
 });
 
 // gerar narração (voz) com ElevenLabs e salvar no Storage público; retorna URL
+app.get("/shared-voices", auth, async (req, res) => {
+  try {
+    if (!ELEVENLABS_API_KEY) return res.status(400).json({ error: "falta ELEVENLABS_API_KEY" });
+    const lang = req.query.lang || "pt";
+    const gender = req.query.gender || "female";
+    const r = await fetch(`https://api.elevenlabs.io/v1/shared-voices?page_size=40&language=${lang}&gender=${gender}`, { headers: { "xi-api-key": ELEVENLABS_API_KEY } });
+    const data = await r.json();
+    if (!r.ok) return res.status(400).json({ error: JSON.stringify(data) });
+    const voices = (data.voices || []).map((v) => ({ public_owner_id: v.public_owner_id, voice_id: v.voice_id, name: v.name, accent: v.accent, language: v.language, descriptive: v.descriptive }));
+    res.json({ ok: true, voices });
+  } catch (e) { res.status(400).json({ error: String(e.message || e) }); }
+});
+
+app.post("/add-voice", auth, async (req, res) => {
+  try {
+    if (!ELEVENLABS_API_KEY) return res.status(400).json({ error: "falta ELEVENLABS_API_KEY" });
+    const { public_owner_id, voice_id, name } = req.body || {};
+    if (!public_owner_id || !voice_id) return res.status(400).json({ error: "public_owner_id e voice_id obrigatorios" });
+    const r = await fetch(`https://api.elevenlabs.io/v1/voices/add/${public_owner_id}/${voice_id}`, {
+      method: "POST",
+      headers: { "xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify({ new_name: name || "Voz BR Funil Vivo" }),
+    });
+    const data = await r.json();
+    if (!r.ok) return res.status(400).json({ error: JSON.stringify(data) });
+    res.json({ ok: true, voice_id: data.voice_id });
+  } catch (e) { res.status(400).json({ error: String(e.message || e) }); }
+});
+
 app.post("/tts", auth, async (req, res) => {
   try {
     if (!ELEVENLABS_API_KEY) return res.status(400).json({ error: "falta ELEVENLABS_API_KEY" });
