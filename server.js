@@ -9,6 +9,8 @@ const {
   SUPABASE_URL,
   SUPABASE_SERVICE_ROLE_KEY,
   ALLOWED_ORIGINS = "https://app.funilvivo.com.br",
+  ELEVENLABS_API_KEY,
+  ELEVENLABS_VOICE_ID = "21m00Tcm4TlvDq8ikWAM",
   PORT = 3000,
 } = process.env;
 
@@ -126,6 +128,44 @@ app.post("/wa/:id/logout", auth, async (req, res) => {
     await evo(canal, `/instance/logout/${encodeURIComponent(canal.instancia)}`, "DELETE");
     await setWaStatus(canal.id, "desconectado");
     res.json({ ok: true });
+  } catch (e) { res.status(400).json({ error: String(e.message || e) }); }
+});
+
+// listar vozes disponíveis na ElevenLabs (para escolher voz feminina PT)
+app.get("/voices", auth, async (_req, res) => {
+  try {
+    if (!ELEVENLABS_API_KEY) return res.status(400).json({ error: "falta ELEVENLABS_API_KEY" });
+    const r = await fetch("https://api.elevenlabs.io/v1/voices", { headers: { "xi-api-key": ELEVENLABS_API_KEY } });
+    const data = await r.json();
+    if (!r.ok) return res.status(400).json({ error: JSON.stringify(data) });
+    const voices = (data.voices || []).map((v) => ({ id: v.voice_id, name: v.name, labels: v.labels }));
+    res.json({ ok: true, voices });
+  } catch (e) { res.status(400).json({ error: String(e.message || e) }); }
+});
+
+// gerar narração (voz) com ElevenLabs e salvar no Storage público; retorna URL
+app.post("/tts", auth, async (req, res) => {
+  try {
+    if (!ELEVENLABS_API_KEY) return res.status(400).json({ error: "falta ELEVENLABS_API_KEY" });
+    const { text, voice_id, stability = 0.4, style = 0.6, similarity = 0.85 } = req.body || {};
+    if (!text) return res.status(400).json({ error: "text obrigatório" });
+    const vid = voice_id || ELEVENLABS_VOICE_ID;
+    const r = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${vid}?output_format=mp3_44100_128`, {
+      method: "POST",
+      headers: { "xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        text,
+        model_id: "eleven_multilingual_v2",
+        voice_settings: { stability, similarity_boost: similarity, style, use_speaker_boost: true },
+      }),
+    });
+    if (!r.ok) { const t = await r.text(); return res.status(400).json({ error: `ElevenLabs ${r.status}: ${t}` }); }
+    const buf = Buffer.from(await r.arrayBuffer());
+    const path = `tts/${Date.now()}.mp3`;
+    const { error: upErr } = await admin.storage.from("midia").upload(path, buf, { contentType: "audio/mpeg", upsert: true });
+    if (upErr) return res.status(400).json({ error: String(upErr.message || upErr) });
+    const { data: { publicUrl } } = admin.storage.from("midia").getPublicUrl(path);
+    res.json({ ok: true, url: publicUrl });
   } catch (e) { res.status(400).json({ error: String(e.message || e) }); }
 });
 
