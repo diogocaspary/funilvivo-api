@@ -169,6 +169,27 @@ app.post("/tts", auth, async (req, res) => {
   } catch (e) { res.status(400).json({ error: String(e.message || e) }); }
 });
 
+// gerar trilha musical com ElevenLabs Music e salvar no Storage; retorna URL
+app.post("/music", auth, async (req, res) => {
+  try {
+    if (!ELEVENLABS_API_KEY) return res.status(400).json({ error: "falta ELEVENLABS_API_KEY" });
+    const { prompt, length_ms = 20000, instrumental = true } = req.body || {};
+    if (!prompt) return res.status(400).json({ error: "prompt obrigatório" });
+    const r = await fetch("https://api.elevenlabs.io/v1/music?output_format=mp3_44100_128", {
+      method: "POST",
+      headers: { "xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt, music_length_ms: length_ms, force_instrumental: instrumental }),
+    });
+    if (!r.ok) { const t = await r.text(); return res.status(400).json({ error: `ElevenLabs music ${r.status}: ${t}` }); }
+    const buf = Buffer.from(await r.arrayBuffer());
+    const path = `music/${Date.now()}.mp3`;
+    const { error: upErr } = await admin.storage.from("midia").upload(path, buf, { contentType: "audio/mpeg", upsert: true });
+    if (upErr) return res.status(400).json({ error: String(upErr.message || upErr) });
+    const { data: { publicUrl } } = admin.storage.from("midia").getPublicUrl(path);
+    res.json({ ok: true, url: publicUrl });
+  } catch (e) { res.status(400).json({ error: String(e.message || e) }); }
+});
+
 // atualizar perfil do WhatsApp (nome, descrição/recado, foto) via Evolution
 app.post("/wa/:id/profile", auth, async (req, res) => {
   try {
