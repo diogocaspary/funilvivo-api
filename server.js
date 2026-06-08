@@ -129,6 +129,20 @@ app.post("/wa/:id/logout", auth, async (req, res) => {
   } catch (e) { res.status(400).json({ error: String(e.message || e) }); }
 });
 
+// atualizar perfil do WhatsApp (nome, descrição/recado, foto) via Evolution
+app.post("/wa/:id/profile", auth, async (req, res) => {
+  try {
+    const canal = await getCanalWa(req.params.id);
+    const inst = encodeURIComponent(canal.instancia);
+    const { name, status, picture } = req.body || {};
+    const out = {};
+    if (name) out.name = await evo(canal, `/chat/updateProfileName/${inst}`, "POST", { name });
+    if (status) out.status = await evo(canal, `/chat/updateProfileStatus/${inst}`, "POST", { status });
+    if (picture) out.picture = await evo(canal, `/chat/updateProfilePicture/${inst}`, "POST", { picture });
+    res.json({ ok: true, out });
+  } catch (e) { res.status(400).json({ error: String(e.message || e) }); }
+});
+
 // enviar e-mail de um outreach (respeita constância do canal por lead)
 app.post("/send/email", auth, async (req, res) => {
   try {
